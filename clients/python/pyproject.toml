@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "driftdb"
+version = "0.1.0"
+description = "Python client SDK for DriftDB — a next-generation graph database"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Amrit"}]
+requires-python = ">=3.8"
+dependencies = ["requests>=2.28"]
+
+[project.urls]
+Homepage = "https://github.com/amrit/driftdb"
+Documentation = "https://github.com/amrit/driftdb#python-client"

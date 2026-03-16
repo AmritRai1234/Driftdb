@@ -1,0 +1,15 @@
+[package]
+name = "driftdb-query"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "DriftQL query language — lexer, parser, planner, executor"
+
+[dependencies]
+driftdb-core = { path = "../driftdb-core" }
+driftdb-graph = { path = "../driftdb-graph" }
+driftdb-vector = { path = "../driftdb-vector" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

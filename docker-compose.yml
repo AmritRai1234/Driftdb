@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  driftdb:
+    build: .
+    container_name: driftdb
+    ports:
+      - "9210:9210"   # WebSocket
+      - "9211:9211"   # REST API
+    volumes:
+      - drift_data:/data
+      - drift_backups:/backups
+    environment:
+      - DRIFT_TOKEN=change-me-in-production
+    command: >
+      --serve --rest
+      --bind 0.0.0.0
+      --data-dir /data
+      --ws-token change-me-in-production
+    restart: unless-stopped
+
+volumes:
+  drift_data:
+  drift_backups:

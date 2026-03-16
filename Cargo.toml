@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "driftdb-core",
+    "driftdb-graph",
+    "driftdb-vector",
+    "driftdb-query",
+    "driftdb-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Amrit"]
+description = "DriftDB — A next-generation database. Graph-native, time-aware, vector-capable."
+license = "SSPL-1.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+
+# Size-optimized release profile (5.3 MB binary)
+[profile.release]
+lto = "fat"             # Full link-time optimization across all crates
+codegen-units = 1       # Single codegen unit for maximum optimization
+opt-level = "s"         # Optimize for size (20% smaller, ~3% speed cost)
+strip = "symbols"       # Strip debug symbols for smaller binary
+panic = "abort"         # No unwinding overhead

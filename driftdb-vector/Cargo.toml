@@ -1,0 +1,13 @@
+[package]
+name = "driftdb-vector"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Vector engine for DriftDB — embeddings, similarity search, ANN indexing"
+
+[dependencies]
+driftdb-core = { path = "../driftdb-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

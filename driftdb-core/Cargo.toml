@@ -1,0 +1,22 @@
+[package]
+name = "driftdb-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Core storage engine, types, and temporal logic for DriftDB"
+
+[dependencies]
+sled = "0.34"
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+aes-gcm = "0.10"
+argon2 = "0.5"
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+lz4_flex = "0.11"
+parking_lot = "0.12"

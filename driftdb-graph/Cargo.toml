@@ -1,0 +1,14 @@
+[package]
+name = "driftdb-graph"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Graph engine for DriftDB — nodes, edges, traversal, pattern matching"
+
+[dependencies]
+driftdb-core = { path = "../driftdb-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }

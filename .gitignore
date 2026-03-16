@@ -1,0 +1,16 @@
+# Build artifacts
+target/
+*.swp
+*.swo
+
+# Database data
+drift_data/
+drift_backups/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,41 @@
+[package]
+name = "driftdb-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "DriftDB server — REPL, CLI, and runtime"
+
+[[bin]]
+name = "driftdb"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bench.rs"
+
+[[bin]]
+name = "heap_bench"
+path = "src/heap_bench.rs"
+
+[dependencies]
+driftdb-core = { path = "../driftdb-core" }
+driftdb-graph = { path = "../driftdb-graph" }
+driftdb-vector = { path = "../driftdb-vector" }
+driftdb-query = { path = "../driftdb-query" }
+rustyline = "14"
+colored = "2"
+comfy-table = "7"
+clap = { version = "4", features = ["derive"] }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+serde = { workspace = true }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"

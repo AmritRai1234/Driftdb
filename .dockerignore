@@ -1,0 +1,7 @@
+target/
+.git/
+drift_data/
+drift_backups/
+*.swp
+*.swo
+.DS_Store
