@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "driftdb"
+name = "driftdb-ai"
 version = "0.1.0"
 description = "The AI-native database client — graph memory + vector search + real-time sync in 5.3 MB"
 readme = "README.md"

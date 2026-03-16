@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+driftdb/__init__.py
+driftdb/client.py
+driftdb_ai.egg-info/PKG-INFO
+driftdb_ai.egg-info/SOURCES.txt
+driftdb_ai.egg-info/dependency_links.txt
+driftdb_ai.egg-info/requires.txt
+driftdb_ai.egg-info/top_level.txt
