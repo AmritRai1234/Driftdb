@@ -10,8 +10,8 @@
 //! - CORS enabled
 
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Path, State},
+    http::{HeaderMap, Method, StatusCode},
     response::Json,
     routing::{delete, get, post},
     Router,
@@ -24,10 +24,10 @@ use driftdb_query::Executor;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -40,14 +40,20 @@ const MAX_QUERY_SIZE: usize = 64 * 1024;
 const MAX_LABELS: usize = 16;
 /// Max properties per node
 const MAX_PROPERTIES: usize = 128;
-/// Rate limit: max requests per second
-const RATE_LIMIT_PER_SEC: u64 = 100;
+/// Rate limit: max requests per second per IP
+const RATE_LIMIT_PER_SEC: u64 = 50;
 /// Max request body size (1 MB)
 const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 // ═══════════════════════════════════════════════════════════════════
 // State
 // ═══════════════════════════════════════════════════════════════════
+
+/// Per-IP rate limiter entry
+pub struct RateBucket {
+    count: u64,
+    window_start: Instant,
+}
 
 /// Shared application state for all handlers
 #[allow(dead_code)]
@@ -56,9 +62,8 @@ pub struct AppState {
     pub graph: Arc<GraphEngine>,
     pub vector: Arc<VectorEngine>,
     pub auth_token: Option<String>,
-    /// Rate limiter state
-    pub request_count: AtomicU64,
-    pub rate_window_start: Mutex<Instant>,
+    /// Per-IP rate limiter: IP → (request_count, window_start)
+    pub rate_buckets: Mutex<HashMap<SocketAddr, RateBucket>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -135,29 +140,41 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Rate limit check only (no auth) — used for public endpoints like /health
-fn check_rate_limit(state: &AppState) -> Result<(), (StatusCode, Json<ApiResponse>)> {
-    let mut window = state.rate_window_start.lock().unwrap_or_else(|e| e.into_inner());
+/// Per-IP rate limit check — sliding window counter
+fn check_rate_limit_ip(state: &AppState, addr: SocketAddr) -> Result<(), (StatusCode, Json<ApiResponse>)> {
+    let mut buckets = state.rate_buckets.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    if now.duration_since(*window).as_secs() >= 1 {
-        // New window
-        state.request_count.store(1, Ordering::Relaxed);
-        *window = now;
+
+    let bucket = buckets.entry(addr).or_insert_with(|| RateBucket {
+        count: 0,
+        window_start: now,
+    });
+
+    if now.duration_since(bucket.window_start).as_secs() >= 1 {
+        // New window — reset
+        bucket.count = 1;
+        bucket.window_start = now;
     } else {
-        let count = state.request_count.fetch_add(1, Ordering::Relaxed);
-        if count >= RATE_LIMIT_PER_SEC {
+        bucket.count += 1;
+        if bucket.count > RATE_LIMIT_PER_SEC {
             return Err(ApiResponse::err(
                 StatusCode::TOO_MANY_REQUESTS,
-                "Rate limit exceeded (100 req/sec)",
+                &format!("Rate limit exceeded ({} req/sec per IP)", RATE_LIMIT_PER_SEC),
             ));
         }
     }
+
+    // Periodic cleanup: remove stale entries (every ~100 requests)
+    if buckets.len() > 1000 {
+        buckets.retain(|_, b| now.duration_since(b.window_start).as_secs() < 60);
+    }
+
     Ok(())
 }
 
-fn check_auth_and_rate(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<ApiResponse>)> {
-    // 1. Rate limiting
-    check_rate_limit(state)?;
+fn check_auth_and_rate(state: &AppState, headers: &HeaderMap, addr: SocketAddr) -> Result<(), (StatusCode, Json<ApiResponse>)> {
+    // 1. Per-IP rate limiting
+    check_rate_limit_ip(state, addr)?;
 
     // 2. Token auth (constant-time comparison)
     if let Some(ref expected) = state.auth_token {
@@ -183,10 +200,15 @@ fn check_auth_and_rate(state: &AppState, headers: &HeaderMap) -> Result<(), (Sta
 
 /// Build the axum router with all REST endpoints
 pub fn build_router(state: Arc<AppState>) -> Router {
+    // SECURITY: Restrict CORS to only needed methods (no PUT/PATCH/TRACE)
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::DELETE,
+        ])
+        .allow_headers(tower_http::cors::Any);
 
     Router::new()
         .route("/health", get(health_handler))
@@ -210,9 +232,9 @@ pub async fn start_rest_server(
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("  🌐 REST API listening on http://{}", addr);
-    println!("  🛡️  Body limit: {}MB, Rate limit: {}/sec",
+    println!("  🛡️  Body limit: {}MB, Rate limit: {}/sec/IP",
         MAX_BODY_SIZE / (1024 * 1024), RATE_LIMIT_PER_SEC);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -223,15 +245,16 @@ pub async fn start_rest_server(
 /// GET /health — Health check + database stats (rate-limited, no auth required)
 async fn health_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    // SECURITY: Rate limit even public endpoints to prevent abuse
-    check_rate_limit(&state)?;
+    // SECURITY: Per-IP rate limit even public endpoints to prevent abuse
+    check_rate_limit_ip(&state, addr)?;
 
     let stats = state.graph.storage.stats().ok();
     Ok(ApiResponse::ok(json!({
         "status": "healthy",
         "engine": "DriftDB",
-        "version": "0.1.2",
+        "version": "0.1.3",
         "stats": stats.map(|s| s.to_string()),
     })))
 }
@@ -239,10 +262,11 @@ async fn health_handler(
 /// POST /query — Execute a DriftQL query
 async fn query_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers)?;
+    check_auth_and_rate(&state, &headers, addr)?;
 
     // SECURITY: Cap query size to prevent memory exhaustion
     if req.query.len() > MAX_QUERY_SIZE {
@@ -275,9 +299,10 @@ async fn query_handler(
 /// GET /nodes — List all nodes
 async fn list_nodes_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers)?;
+    check_auth_and_rate(&state, &headers, addr)?;
 
     let nodes = state
         .graph
@@ -304,10 +329,11 @@ async fn list_nodes_handler(
 /// GET /nodes/:id — Get a single node
 async fn get_node_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers)?;
+    check_auth_and_rate(&state, &headers, addr)?;
 
     let node_id = NodeId::from_str(&id);
     match state.graph.get_node(&node_id) {
@@ -327,10 +353,11 @@ async fn get_node_handler(
 /// POST /nodes — Create a node
 async fn create_node_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<CreateNodeRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse>), (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers)?;
+    check_auth_and_rate(&state, &headers, addr)?;
 
     // SECURITY: Validate input limits
     if req.labels.len() > MAX_LABELS {
@@ -381,10 +408,11 @@ async fn create_node_handler(
 /// DELETE /nodes/:id — Soft-delete a node
 async fn delete_node_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers)?;
+    check_auth_and_rate(&state, &headers, addr)?;
 
     let node_id = NodeId::from_str(&id);
     match state.graph.delete_node(&node_id) {
@@ -399,10 +427,11 @@ async fn delete_node_handler(
 /// POST /backup — Create a backup
 async fn backup_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<BackupRequest>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers)?;
+    check_auth_and_rate(&state, &headers, addr)?;
 
     // SECURITY: Path traversal prevention (hardened)
     let dir = &req.directory;

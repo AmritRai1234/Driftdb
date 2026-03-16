@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite::Message;
 /// Maximum WebSocket message size (16 KB)
 const MAX_MESSAGE_SIZE: usize = 16 * 1024;
 /// Maximum connections allowed
-const MAX_CONNECTIONS: usize = 128;
+const MAX_CONNECTIONS: usize = 64;
 /// Maximum messages per second per client (rate limit)
 const RATE_LIMIT_PER_SEC: u32 = 100;
 /// Maximum subscriptions per client

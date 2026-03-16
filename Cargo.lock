@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "driftdb-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "driftdb-graph"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "driftdb-core",
@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "driftdb-query"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "driftdb-core",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "driftdb-server"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "axum",
  "chrono",
@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "driftdb-vector"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "driftdb-core",
  "serde",

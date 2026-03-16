@@ -203,8 +203,7 @@ fn main() {
                 graph: graph.clone(),
                 vector: vector.clone(),
                 auth_token: rest_auth_token,
-                request_count: std::sync::atomic::AtomicU64::new(0),
-                rate_window_start: std::sync::Mutex::new(std::time::Instant::now()),
+                rate_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
             let rest_addr_clone = rest_addr.clone();
             std::thread::spawn(move || {
