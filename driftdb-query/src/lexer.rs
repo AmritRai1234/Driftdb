@@ -55,8 +55,46 @@ pub enum Token {
     Eof,
 }
 
+/// SECURITY: Check for `--` comment sequences outside of string literals.
+/// Comments are rejected entirely to prevent injection attacks like:
+///   SHOW STATS -- DROP ALL
+/// which would silently strip the injected suffix.
+fn reject_comments(input: &str) -> DriftResult<()> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        // Skip over string literals — comments inside strings are fine
+        if ch == '"' || ch == '\'' {
+            let quote = ch;
+            i += 1;
+            while i < chars.len() && chars[i] != quote {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 1; // skip escaped char
+                }
+                i += 1;
+            }
+            i += 1; // skip closing quote
+            continue;
+        }
+        // Detect `--` that is NOT `-->`
+        if ch == '-' && i + 1 < chars.len() && chars[i + 1] == '-'
+            && !(i + 2 < chars.len() && chars[i + 2] == '>')
+        {
+            return Err(DriftError::InvalidQuery(
+                "Comments (--) are not allowed in queries — possible injection blocked".into(),
+            ));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Tokenize a DriftQL query string
 pub fn tokenize(input: &str) -> DriftResult<Vec<Token>> {
+    // SECURITY: Reject comment sequences before tokenizing
+    reject_comments(input)?;
+
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
@@ -67,16 +105,6 @@ pub fn tokenize(input: &str) -> DriftResult<Vec<Token>> {
         // Skip whitespace
         if ch.is_whitespace() {
             i += 1;
-            continue;
-        }
-
-        // Skip comments (-- line comments)
-        if ch == '-' && i + 1 < chars.len() && chars[i + 1] == '-'
-            && !(i + 2 < chars.len() && chars[i + 2] == '>')
-        {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
             continue;
         }
 
@@ -273,5 +301,30 @@ mod tests {
         let tokens = tokenize("42 3.14").unwrap();
         assert!(matches!(tokens[0], Token::IntLiteral(42)));
         assert!(matches!(tokens[1], Token::FloatLiteral(_)));
+    }
+
+    // ── Security tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_comment_injection_blocked() {
+        // This was the exact attack vector: SHOW STATS -- DROP ALL
+        let result = tokenize("SHOW STATS -- DROP ALL");
+        assert!(result.is_err(), "Comment injection should be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Comments (--) are not allowed"), "Error: {}", err);
+    }
+
+    #[test]
+    fn test_comment_inside_string_allowed() {
+        // Dashes inside string literals are perfectly safe
+        let tokens = tokenize("CREATE (u:User {name: \"hello -- world\"})").unwrap();
+        assert!(matches!(tokens[0], Token::Create));
+    }
+
+    #[test]
+    fn test_arrow_not_blocked() {
+        // --> is an arrow, not a comment — must still work
+        let tokens = tokenize("FIND (a)-[:LIKES]->(b)").unwrap();
+        assert!(tokens.iter().any(|t| matches!(t, Token::Arrow)));
     }
 }

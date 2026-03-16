@@ -56,6 +56,10 @@ struct Cli {
     #[arg(long)]
     ws_token: Option<String>,
 
+    /// Authentication token for REST API (defaults to --ws-token if not set)
+    #[arg(long)]
+    rest_token: Option<String>,
+
     /// Enable REST API server
     #[arg(long)]
     rest: bool,
@@ -182,12 +186,23 @@ fn main() {
 
         // Run REST API server in background thread (if --rest)
         if cli.rest {
+            // SECURITY: REST token defaults to ws_token if not explicitly set
+            let rest_auth_token = cli.rest_token.clone().or_else(|| cli.ws_token.clone());
+
+            if rest_auth_token.is_none() {
+                println!(
+                    "  {} {}",
+                    "⚠".bright_yellow(),
+                    "WARNING: REST API has no auth token! Set --rest-token or --ws-token".bright_red()
+                );
+            }
+
             let rest_addr = format!("{}:{}", cli.bind, cli.rest_port);
             let rest_state = Arc::new(rest_api::AppState {
                 executor: std::sync::Mutex::new(Executor::new(graph.clone(), vector.clone())),
                 graph: graph.clone(),
                 vector: vector.clone(),
-                auth_token: cli.ws_token.clone(),
+                auth_token: rest_auth_token,
                 request_count: std::sync::atomic::AtomicU64::new(0),
                 rate_window_start: std::sync::Mutex::new(std::time::Instant::now()),
             });

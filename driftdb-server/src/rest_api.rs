@@ -4,7 +4,8 @@
 //! - Constant-time token comparison (anti timing-attack)
 //! - Rate limiting (100 req/sec global cap)
 //! - Query size limit (64KB)
-//! - Path traversal prevention on backup paths
+//! - Request body size limit (1MB — returns 413)
+//! - Path traversal prevention on backup paths (relative-only, canonicalized)
 //! - Input validation (label count, property count)
 //! - CORS enabled
 
@@ -27,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 
 // ═══════════════════════════════════════════════════════════════════
 // Security Constants
@@ -40,6 +42,8 @@ const MAX_LABELS: usize = 16;
 const MAX_PROPERTIES: usize = 128;
 /// Rate limit: max requests per second
 const RATE_LIMIT_PER_SEC: u64 = 100;
+/// Max request body size (1 MB)
+const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 // ═══════════════════════════════════════════════════════════════════
 // State
@@ -131,25 +135,29 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn check_auth_and_rate(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<ApiResponse>)> {
-    // 1. Rate limiting
-    {
-        let mut window = state.rate_window_start.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        if now.duration_since(*window).as_secs() >= 1 {
-            // New window
-            state.request_count.store(1, Ordering::Relaxed);
-            *window = now;
-        } else {
-            let count = state.request_count.fetch_add(1, Ordering::Relaxed);
-            if count >= RATE_LIMIT_PER_SEC {
-                return Err(ApiResponse::err(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "Rate limit exceeded (100 req/sec)",
-                ));
-            }
+/// Rate limit check only (no auth) — used for public endpoints like /health
+fn check_rate_limit(state: &AppState) -> Result<(), (StatusCode, Json<ApiResponse>)> {
+    let mut window = state.rate_window_start.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if now.duration_since(*window).as_secs() >= 1 {
+        // New window
+        state.request_count.store(1, Ordering::Relaxed);
+        *window = now;
+    } else {
+        let count = state.request_count.fetch_add(1, Ordering::Relaxed);
+        if count >= RATE_LIMIT_PER_SEC {
+            return Err(ApiResponse::err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit exceeded (100 req/sec)",
+            ));
         }
     }
+    Ok(())
+}
+
+fn check_auth_and_rate(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<ApiResponse>)> {
+    // 1. Rate limiting
+    check_rate_limit(state)?;
 
     // 2. Token auth (constant-time comparison)
     if let Some(ref expected) = state.auth_token {
@@ -189,6 +197,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/nodes/{id}", delete(delete_node_handler))
         .route("/backup", post(backup_handler))
         .layer(cors)
+        // SECURITY: Global request body size limit — returns 413 for payloads > 1MB
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .with_state(state)
 }
 
@@ -200,6 +210,8 @@ pub async fn start_rest_server(
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("  🌐 REST API listening on http://{}", addr);
+    println!("  🛡️  Body limit: {}MB, Rate limit: {}/sec",
+        MAX_BODY_SIZE / (1024 * 1024), RATE_LIMIT_PER_SEC);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -208,17 +220,20 @@ pub async fn start_rest_server(
 // Handlers
 // ═══════════════════════════════════════════════════════════════════
 
-/// GET /health — Health check + database stats
+/// GET /health — Health check + database stats (rate-limited, no auth required)
 async fn health_handler(
     State(state): State<Arc<AppState>>,
-) -> Json<ApiResponse> {
+) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
+    // SECURITY: Rate limit even public endpoints to prevent abuse
+    check_rate_limit(&state)?;
+
     let stats = state.graph.storage.stats().ok();
-    ApiResponse::ok(json!({
+    Ok(ApiResponse::ok(json!({
         "status": "healthy",
         "engine": "DriftDB",
-        "version": "0.1.0",
+        "version": "0.1.2",
         "stats": stats.map(|s| s.to_string()),
-    }))
+    })))
 }
 
 /// POST /query — Execute a DriftQL query
@@ -251,7 +266,7 @@ async fn query_handler(
     match result {
         Ok(qr) => Ok(ApiResponse::ok(query_result_to_json(qr))),
         Err(e) => Err(ApiResponse::err(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_REQUEST,
             &format!("{}", e),
         )),
     }
@@ -389,20 +404,44 @@ async fn backup_handler(
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
     check_auth_and_rate(&state, &headers)?;
 
-    // SECURITY: Path traversal prevention
+    // SECURITY: Path traversal prevention (hardened)
     let dir = &req.directory;
+
+    // Reject path traversal sequences
     if dir.contains("..") || dir.contains('~') {
         return Err(ApiResponse::err(
             StatusCode::BAD_REQUEST,
             "Backup directory must not contain '..' or '~' (path traversal blocked)",
         ));
     }
+
+    // Reject absolute paths — only relative paths within the project are allowed
+    if dir.starts_with('/') {
+        return Err(ApiResponse::err(
+            StatusCode::BAD_REQUEST,
+            "Backup directory must be a relative path (absolute paths blocked)",
+        ));
+    }
+
+    // Reject system directories by prefix
     let blocked = ["/etc", "/usr", "/bin", "/sbin", "/var", "/proc", "/sys", "/dev"];
     for prefix in &blocked {
         if dir.starts_with(prefix) {
             return Err(ApiResponse::err(
                 StatusCode::BAD_REQUEST,
                 &format!("Cannot create backups in system directory '{}'", prefix),
+            ));
+        }
+    }
+
+    // Validate the resolved path stays within the current working directory
+    let resolved = std::path::Path::new(dir);
+    if let Ok(canonical) = std::fs::canonicalize(resolved.parent().unwrap_or(resolved)) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if !canonical.starts_with(&cwd) {
+            return Err(ApiResponse::err(
+                StatusCode::BAD_REQUEST,
+                "Backup directory must resolve within the project directory",
             ));
         }
     }
