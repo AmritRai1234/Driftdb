@@ -374,7 +374,7 @@ async fn health_handler(
         Ok(ApiResponse::ok(json!({
             "status": "healthy",
             "engine": "DriftDB",
-            "version": "0.1.4",
+            "version": "0.1.5",
             "stats": stats.map(|s| s.to_string()),
             "connections": state.active_connections.load(Ordering::Relaxed),
         })))

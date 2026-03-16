@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: driftdb-ai
-Version: 0.1.4
+Version: 0.1.5
 Summary: The AI-native database client — graph memory + vector search + real-time sync in 5.3 MB
 Author: Amrit
 License: SSPL-1.0

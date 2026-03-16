@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "driftdb-ai"
-version = "0.1.4"
+version = "0.1.5"
 description = "The AI-native database client — graph memory + vector search + real-time sync in 5.3 MB"
 readme = "README.md"
 license = {text = "SSPL-1.0"}
