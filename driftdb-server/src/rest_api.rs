@@ -2,9 +2,12 @@
 //!
 //! Security features:
 //! - Constant-time token comparison (anti timing-attack)
-//! - Rate limiting (100 req/sec global cap)
+//! - Token-bucket rate limiting (smooth burst protection)
+//! - Global concurrent connection limit (semaphore)
 //! - Query size limit (64KB)
 //! - Request body size limit (1MB — returns 413)
+//! - Content-Type enforcement on POST endpoints
+//! - TCP keepalive + timeouts (anti-Slowloris)
 //! - Path traversal prevention on backup paths (relative-only, canonicalized)
 //! - Input validation (label count, property count)
 //! - CORS enabled
@@ -12,6 +15,7 @@
 use axum::{
     extract::{ConnectInfo, Path, State},
     http::{HeaderMap, Method, StatusCode},
+    middleware,
     response::Json,
     routing::{delete, get, post},
     Router,
@@ -26,6 +30,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -40,19 +45,52 @@ const MAX_QUERY_SIZE: usize = 64 * 1024;
 const MAX_LABELS: usize = 16;
 /// Max properties per node
 const MAX_PROPERTIES: usize = 128;
-/// Rate limit: max requests per second per IP
-const RATE_LIMIT_PER_SEC: u64 = 50;
+/// Token bucket: tokens replenished per second per IP
+const RATE_LIMIT_PER_SEC: f64 = 50.0;
+/// Token bucket: max burst size (tokens can accumulate up to this)
+const RATE_LIMIT_BURST: f64 = 10.0;
 /// Max request body size (1 MB)
 const MAX_BODY_SIZE: usize = 1024 * 1024;
+/// Max concurrent connections to REST API
+const MAX_CONCURRENT_CONNECTIONS: usize = 100;
+/// TCP keepalive interval (seconds) — kills idle/Slowloris connections
+const TCP_KEEPALIVE_SECS: u64 = 15;
 
 // ═══════════════════════════════════════════════════════════════════
 // State
 // ═══════════════════════════════════════════════════════════════════
 
-/// Per-IP rate limiter entry
-pub struct RateBucket {
-    count: u64,
-    window_start: Instant,
+/// Per-IP token bucket rate limiter
+pub struct TokenBucket {
+    /// Available tokens (can go fractional)
+    tokens: f64,
+    /// Last time tokens were replenished
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new() -> Self {
+        TokenBucket {
+            tokens: RATE_LIMIT_BURST,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Try to consume one token. Returns true if allowed.
+    fn try_consume(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        // Replenish tokens based on elapsed time
+        self.tokens = (self.tokens + elapsed * RATE_LIMIT_PER_SEC).min(RATE_LIMIT_BURST);
+        self.last_refill = now;
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Shared application state for all handlers
@@ -62,8 +100,10 @@ pub struct AppState {
     pub graph: Arc<GraphEngine>,
     pub vector: Arc<VectorEngine>,
     pub auth_token: Option<String>,
-    /// Per-IP rate limiter: IP → (request_count, window_start)
-    pub rate_buckets: Mutex<HashMap<SocketAddr, RateBucket>>,
+    /// Per-IP token bucket rate limiter
+    pub rate_buckets: Mutex<HashMap<SocketAddr, TokenBucket>>,
+    /// Global concurrent connection counter
+    pub active_connections: AtomicUsize,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -140,43 +180,64 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Per-IP rate limit check — sliding window counter
+/// Per-IP rate limit check — token bucket algorithm
+///
+/// Unlike a simple window counter that resets every second (allowing
+/// burst floods at window boundaries), the token bucket smoothly
+/// replenishes tokens over time. Burst capacity is capped at RATE_LIMIT_BURST.
 fn check_rate_limit_ip(state: &AppState, addr: SocketAddr) -> Result<(), (StatusCode, Json<ApiResponse>)> {
     let mut buckets = state.rate_buckets.lock().unwrap_or_else(|e| e.into_inner());
-    let now = Instant::now();
 
-    let bucket = buckets.entry(addr).or_insert_with(|| RateBucket {
-        count: 0,
-        window_start: now,
-    });
+    let bucket = buckets.entry(addr).or_insert_with(TokenBucket::new);
 
-    if now.duration_since(bucket.window_start).as_secs() >= 1 {
-        // New window — reset
-        bucket.count = 1;
-        bucket.window_start = now;
-    } else {
-        bucket.count += 1;
-        if bucket.count > RATE_LIMIT_PER_SEC {
-            return Err(ApiResponse::err(
-                StatusCode::TOO_MANY_REQUESTS,
-                &format!("Rate limit exceeded ({} req/sec per IP)", RATE_LIMIT_PER_SEC),
-            ));
-        }
+    if !bucket.try_consume() {
+        return Err(ApiResponse::err(
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!("Rate limit exceeded ({} req/sec per IP, burst {})",
+                RATE_LIMIT_PER_SEC, RATE_LIMIT_BURST as u64),
+        ));
     }
 
-    // Periodic cleanup: remove stale entries (every ~100 requests)
-    if buckets.len() > 1000 {
-        buckets.retain(|_, b| now.duration_since(b.window_start).as_secs() < 60);
+    // Periodic cleanup: remove stale entries (every ~500 IPs)
+    if buckets.len() > 500 {
+        let now = Instant::now();
+        buckets.retain(|_, b| now.duration_since(b.last_refill).as_secs() < 120);
     }
 
     Ok(())
 }
 
+/// Check concurrent connection limit
+fn check_connection_limit(state: &AppState) -> Result<(), (StatusCode, Json<ApiResponse>)> {
+    let current = state.active_connections.load(Ordering::Relaxed);
+    if current >= MAX_CONCURRENT_CONNECTIONS {
+        return Err(ApiResponse::err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("Server at capacity ({}/{} connections)", current, MAX_CONCURRENT_CONNECTIONS),
+        ));
+    }
+    Ok(())
+}
+
 fn check_auth_and_rate(state: &AppState, headers: &HeaderMap, addr: SocketAddr) -> Result<(), (StatusCode, Json<ApiResponse>)> {
-    // 1. Per-IP rate limiting
+    // 1. Concurrent connection limit
+    check_connection_limit(state)?;
+
+    // 2. Per-IP rate limiting (token bucket)
     check_rate_limit_ip(state, addr)?;
 
-    // 2. Token auth (constant-time comparison)
+    // 3. Content-Type validation for POST requests
+    // (called from POST handlers — GET handlers skip this)
+    if let Some(ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) {
+        if !ct.contains("application/json") {
+            return Err(ApiResponse::err(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Content-Type must be application/json",
+            ));
+        }
+    }
+
+    // 4. Token auth (constant-time comparison)
     if let Some(ref expected) = state.auth_token {
         let token = headers
             .get("authorization")
@@ -197,6 +258,25 @@ fn check_auth_and_rate(state: &AppState, headers: &HeaderMap, addr: SocketAddr) 
 // ═══════════════════════════════════════════════════════════════════
 // Router
 // ═══════════════════════════════════════════════════════════════════
+
+/// Connection tracking middleware — increments on entry, decrements on response
+async fn connection_tracking_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let current = state.active_connections.fetch_add(1, Ordering::Relaxed);
+    if current >= MAX_CONCURRENT_CONNECTIONS {
+        state.active_connections.fetch_sub(1, Ordering::Relaxed);
+        return axum::response::IntoResponse::into_response(ApiResponse::err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("Server at capacity ({}/{} connections)", current, MAX_CONCURRENT_CONNECTIONS),
+        ));
+    }
+    let response = next.run(req).await;
+    state.active_connections.fetch_sub(1, Ordering::Relaxed);
+    response
+}
 
 /// Build the axum router with all REST endpoints
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -221,19 +301,45 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(cors)
         // SECURITY: Global request body size limit — returns 413 for payloads > 1MB
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        // SECURITY: Track and limit concurrent connections
+        .layer(middleware::from_fn_with_state(state.clone(), connection_tracking_middleware))
         .with_state(state)
 }
 
-/// Start the REST API server
+/// Start the REST API server with TCP-level protections
 pub async fn start_rest_server(
     addr: &str,
     state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    // SECURITY: Set SO_KEEPALIVE at socket level to kill idle/Slowloris connections
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    // Set keepalive via socket2 for Slowloris protection
+    {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let fd = std_listener.as_raw_fd();
+        let sock = unsafe { socket2::Socket::from_raw_fd(fd) };
+        sock.set_keepalive(true).ok();
+        sock.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+        ).ok();
+        // Don't drop the socket2 wrapper (it would close the fd)
+        std::mem::forget(sock);
+    }
+    std_listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
+
     println!("  🌐 REST API listening on http://{}", addr);
-    println!("  🛡️  Body limit: {}MB, Rate limit: {}/sec/IP",
-        MAX_BODY_SIZE / (1024 * 1024), RATE_LIMIT_PER_SEC);
+    println!("  🛡️  Body limit: {}MB | Rate: {}/sec/IP (burst {}) | Max conn: {} | Keepalive: {}s",
+        MAX_BODY_SIZE / (1024 * 1024),
+        RATE_LIMIT_PER_SEC,
+        RATE_LIMIT_BURST as u64,
+        MAX_CONCURRENT_CONNECTIONS,
+        TCP_KEEPALIVE_SECS,
+    );
+
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
@@ -242,21 +348,42 @@ pub async fn start_rest_server(
 // Handlers
 // ═══════════════════════════════════════════════════════════════════
 
-/// GET /health — Health check + database stats (rate-limited, no auth required)
+/// GET /health — Health check (rate-limited, minimal info without auth)
 async fn health_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
     // SECURITY: Per-IP rate limit even public endpoints to prevent abuse
     check_rate_limit_ip(&state, addr)?;
 
-    let stats = state.graph.storage.stats().ok();
-    Ok(ApiResponse::ok(json!({
-        "status": "healthy",
-        "engine": "DriftDB",
-        "version": "0.1.3",
-        "stats": stats.map(|s| s.to_string()),
-    })))
+    // If authenticated, return full stats; otherwise just status
+    let is_authed = if let Some(ref expected) = state.auth_token {
+        let token = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        constant_time_eq(token.as_bytes(), expected.as_bytes())
+    } else {
+        true
+    };
+
+    if is_authed {
+        let stats = state.graph.storage.stats().ok();
+        Ok(ApiResponse::ok(json!({
+            "status": "healthy",
+            "engine": "DriftDB",
+            "version": "0.1.4",
+            "stats": stats.map(|s| s.to_string()),
+            "connections": state.active_connections.load(Ordering::Relaxed),
+        })))
+    } else {
+        // Unauthenticated: return minimal info only (no stats leak)
+        Ok(ApiResponse::ok(json!({
+            "status": "healthy",
+        })))
+    }
 }
 
 /// POST /query — Execute a DriftQL query

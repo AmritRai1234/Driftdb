@@ -204,6 +204,7 @@ fn main() {
                 vector: vector.clone(),
                 auth_token: rest_auth_token,
                 rate_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+                active_connections: std::sync::atomic::AtomicUsize::new(0),
             });
             let rest_addr_clone = rest_addr.clone();
             std::thread::spawn(move || {

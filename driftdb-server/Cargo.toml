@@ -36,6 +36,7 @@ tower-http = { version = "0.5", features = ["cors", "limit"] }
 serde = { workspace = true }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+socket2 = "0.5"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"

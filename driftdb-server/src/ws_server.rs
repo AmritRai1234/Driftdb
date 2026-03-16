@@ -118,12 +118,30 @@ impl SyncServer {
         loop {
             let (stream, peer_addr) = listener.accept().await?;
 
-            // Check connection limit BEFORE accepting
-            let current = self.connection_count.load(Ordering::Relaxed);
-            if current >= MAX_CONNECTIONS {
+            // SECURITY: Atomic check-and-increment to prevent TOCTOU race.
+            // The old pattern (load → check → fetch_add) allowed two threads
+            // to both see count=63, both pass the check, and both increment,
+            // exceeding the limit. compare_exchange atomically does both.
+            let acquired = loop {
+                let current = self.connection_count.load(Ordering::SeqCst);
+                if current >= MAX_CONNECTIONS {
+                    break false;
+                }
+                match self.connection_count.compare_exchange(
+                    current,
+                    current + 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break true,
+                    Err(_) => continue, // Another thread changed it; retry
+                }
+            };
+
+            if !acquired {
                 eprintln!(
                     "  ⚠ Connection rejected from {} (limit {}/{})",
-                    peer_addr, current, MAX_CONNECTIONS
+                    peer_addr, self.connection_count.load(Ordering::Relaxed), MAX_CONNECTIONS
                 );
                 drop(stream);
                 continue;
@@ -136,7 +154,7 @@ impl SyncServer {
             let tls = tls_acceptor.clone();
 
             tokio::spawn(async move {
-                conn_count.fetch_add(1, Ordering::Relaxed);
+                // Connection already counted above via compare_exchange
 
                 let result = if let Some(acceptor) = tls {
                     // TLS connection: TCP → TLS → WebSocket
@@ -158,7 +176,7 @@ impl SyncServer {
                     eprintln!("  ✗ Client {} error: {}", peer_addr, e);
                 }
 
-                conn_count.fetch_sub(1, Ordering::Relaxed);
+                conn_count.fetch_sub(1, Ordering::SeqCst);
             });
         }
     }
