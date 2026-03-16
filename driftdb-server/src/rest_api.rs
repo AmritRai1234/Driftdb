@@ -28,7 +28,7 @@ use driftdb_query::Executor;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -100,8 +100,8 @@ pub struct AppState {
     pub graph: Arc<GraphEngine>,
     pub vector: Arc<VectorEngine>,
     pub auth_token: Option<String>,
-    /// Per-IP token bucket rate limiter
-    pub rate_buckets: Mutex<HashMap<SocketAddr, TokenBucket>>,
+    /// Per-IP token bucket rate limiter (keyed by IP address, NOT socket addr)
+    pub rate_buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
     /// Global concurrent connection counter
     pub active_connections: AtomicUsize,
 }
@@ -185,10 +185,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Unlike a simple window counter that resets every second (allowing
 /// burst floods at window boundaries), the token bucket smoothly
 /// replenishes tokens over time. Burst capacity is capped at RATE_LIMIT_BURST.
-fn check_rate_limit_ip(state: &AppState, addr: SocketAddr) -> Result<(), (StatusCode, Json<ApiResponse>)> {
+fn check_rate_limit_ip(state: &AppState, ip: IpAddr) -> Result<(), (StatusCode, Json<ApiResponse>)> {
     let mut buckets = state.rate_buckets.lock().unwrap_or_else(|e| e.into_inner());
 
-    let bucket = buckets.entry(addr).or_insert_with(TokenBucket::new);
+    let bucket = buckets.entry(ip).or_insert_with(TokenBucket::new);
 
     if !bucket.try_consume() {
         return Err(ApiResponse::err(
@@ -219,12 +219,12 @@ fn check_connection_limit(state: &AppState) -> Result<(), (StatusCode, Json<ApiR
     Ok(())
 }
 
-fn check_auth_and_rate(state: &AppState, headers: &HeaderMap, addr: SocketAddr) -> Result<(), (StatusCode, Json<ApiResponse>)> {
+fn check_auth_and_rate(state: &AppState, headers: &HeaderMap, ip: IpAddr) -> Result<(), (StatusCode, Json<ApiResponse>)> {
     // 1. Concurrent connection limit
     check_connection_limit(state)?;
 
     // 2. Per-IP rate limiting (token bucket)
-    check_rate_limit_ip(state, addr)?;
+    check_rate_limit_ip(state, ip)?;
 
     // 3. Content-Type validation for POST requests
     // (called from POST handlers — GET handlers skip this)
@@ -355,7 +355,7 @@ async fn health_handler(
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
     // SECURITY: Per-IP rate limit even public endpoints to prevent abuse
-    check_rate_limit_ip(&state, addr)?;
+    check_rate_limit_ip(&state, addr.ip())?;
 
     // If authenticated, return full stats; otherwise just status
     let is_authed = if let Some(ref expected) = state.auth_token {
@@ -393,7 +393,7 @@ async fn query_handler(
     headers: HeaderMap,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers, addr)?;
+    check_auth_and_rate(&state, &headers, addr.ip())?;
 
     // SECURITY: Cap query size to prevent memory exhaustion
     if req.query.len() > MAX_QUERY_SIZE {
@@ -429,7 +429,7 @@ async fn list_nodes_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers, addr)?;
+    check_auth_and_rate(&state, &headers, addr.ip())?;
 
     let nodes = state
         .graph
@@ -460,7 +460,7 @@ async fn get_node_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers, addr)?;
+    check_auth_and_rate(&state, &headers, addr.ip())?;
 
     let node_id = NodeId::from_str(&id);
     match state.graph.get_node(&node_id) {
@@ -484,7 +484,7 @@ async fn create_node_handler(
     headers: HeaderMap,
     Json(req): Json<CreateNodeRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse>), (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers, addr)?;
+    check_auth_and_rate(&state, &headers, addr.ip())?;
 
     // SECURITY: Validate input limits
     if req.labels.len() > MAX_LABELS {
@@ -539,7 +539,7 @@ async fn delete_node_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers, addr)?;
+    check_auth_and_rate(&state, &headers, addr.ip())?;
 
     let node_id = NodeId::from_str(&id);
     match state.graph.delete_node(&node_id) {
@@ -558,7 +558,7 @@ async fn backup_handler(
     headers: HeaderMap,
     Json(req): Json<BackupRequest>,
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
-    check_auth_and_rate(&state, &headers, addr)?;
+    check_auth_and_rate(&state, &headers, addr.ip())?;
 
     // SECURITY: Path traversal prevention (hardened)
     let dir = &req.directory;
