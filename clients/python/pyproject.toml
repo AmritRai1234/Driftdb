@@ -5,13 +5,37 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "driftdb"
 version = "0.1.0"
-description = "Python client SDK for DriftDB — a next-generation graph database"
+description = "The AI-native database client — graph memory + vector search + real-time sync in 5.3 MB"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "SSPL-1.0"}
 authors = [{name = "Amrit"}]
 requires-python = ">=3.8"
 dependencies = ["requests>=2.28"]
 
+keywords = [
+    "database", "graph-database", "vector-database",
+    "ai", "llm", "memory", "rag", "embeddings",
+    "knowledge-graph", "similarity-search",
+    "real-time", "rust", "driftql",
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+
 [project.urls]
-Homepage = "https://github.com/amrit/driftdb"
-Documentation = "https://github.com/amrit/driftdb#python-client"
+Homepage = "https://github.com/AmritRai1234/Driftdb"
+Documentation = "https://github.com/AmritRai1234/Driftdb/blob/main/DOCS.md"
+Repository = "https://github.com/AmritRai1234/Driftdb"
+"Bug Tracker" = "https://github.com/AmritRai1234/Driftdb/issues"

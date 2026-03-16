@@ -1,3 +1,30 @@
+Metadata-Version: 2.4
+Name: driftdb
+Version: 0.1.0
+Summary: The AI-native database client — graph memory + vector search + real-time sync in 5.3 MB
+Author: Amrit
+License: SSPL-1.0
+Project-URL: Homepage, https://github.com/AmritRai1234/Driftdb
+Project-URL: Documentation, https://github.com/AmritRai1234/Driftdb/blob/main/DOCS.md
+Project-URL: Repository, https://github.com/AmritRai1234/Driftdb
+Project-URL: Bug Tracker, https://github.com/AmritRai1234/Driftdb/issues
+Keywords: database,graph-database,vector-database,ai,llm,memory,rag,embeddings,knowledge-graph,similarity-search,real-time,rust,driftql
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: Topic :: Database
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: requests>=2.28
+
 # DriftDB Python Client
 
 **The AI-native database client.** Graph memory + vector search + real-time sync in 5.3 MB.

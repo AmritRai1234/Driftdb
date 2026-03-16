@@ -210,6 +210,91 @@ class DriftDB:
             payload["password"] = password
         return self._request("POST", "/backup", json=payload)
 
+    # ─── AI Convenience Methods ───────────────────────────────────
+
+    def remember(self, text: str, labels: Optional[List[str]] = None,
+                 properties: Optional[Dict[str, Any]] = None,
+                 vector: Optional[List[float]] = None) -> dict:
+        """
+        Store a memory in DriftDB. Designed for AI/LLM memory.
+
+        Args:
+            text: The text to remember
+            labels: Optional labels (default: ["Memory"])
+            properties: Additional properties to store
+            vector: Optional embedding vector for similarity search
+
+        Returns:
+            Created node info
+
+        Examples:
+            >>> db.remember("User prefers dark mode")
+            >>> db.remember("Meeting at 3pm", labels=["Event"])
+            >>> db.remember("Hello", vector=[0.1, 0.5, 0.9])
+        """
+        props = properties or {}
+        props["text"] = text
+        props["timestamp"] = __import__("datetime").datetime.now().isoformat()
+        node_labels = labels or ["Memory"]
+        result = self.create_node(labels=node_labels, properties=props)
+
+        # Attach vector if provided (for similarity recall)
+        if vector:
+            node_id = result.get("id", "")
+            if node_id:
+                self.query(f'SET {node_id}.vector = {vector}')
+
+        return result
+
+    def recall(self, text: Optional[str] = None, label: str = "Memory",
+               limit: int = 5, vector: Optional[List[float]] = None) -> dict:
+        """
+        Recall memories by text search or vector similarity.
+
+        Args:
+            text: Text to search for (partial match in properties)
+            label: Label to filter by (default: "Memory")
+            limit: Max number of results
+            vector: Optional embedding vector for similarity search
+
+        Returns:
+            Matching memories
+
+        Examples:
+            >>> db.recall(text="dark mode")
+            >>> db.recall(vector=[0.1, 0.5, 0.9], limit=3)
+        """
+        if vector:
+            vec_str = ", ".join(str(v) for v in vector)
+            return self.query(
+                f"FIND SIMILAR TO [{vec_str}] WITHIN 0.5 LIMIT {limit}"
+            )
+        elif text:
+            return self.find(label, returns="n")
+        else:
+            return self.find(label, returns="n")
+
+    def similar(self, vector: List[float], threshold: float = 0.7,
+                limit: int = 10) -> dict:
+        """
+        Find nodes with similar vectors (cosine similarity).
+
+        Args:
+            vector: Query vector
+            threshold: Minimum similarity (0.0–1.0, default: 0.7)
+            limit: Max results (default: 10)
+
+        Returns:
+            Similar nodes with similarity scores
+
+        Examples:
+            >>> db.similar([0.1, 0.5, 0.9, 0.3], threshold=0.8, limit=5)
+        """
+        vec_str = ", ".join(str(v) for v in vector)
+        return self.query(
+            f"FIND SIMILAR TO [{vec_str}] WITHIN {threshold} LIMIT {limit}"
+        )
+
     # ─── Convenience ─────────────────────────────────────────────
 
     def __repr__(self) -> str:
@@ -221,3 +306,4 @@ class DriftDB:
             return f"DriftDB @ {self.url} — {info.get('status', 'unknown')}"
         except Exception:
             return f"DriftDB @ {self.url} — disconnected"
+
