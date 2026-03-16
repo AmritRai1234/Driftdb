@@ -28,12 +28,16 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// Maximum WebSocket message size (16 KB)
 const MAX_MESSAGE_SIZE: usize = 16 * 1024;
-/// Maximum connections allowed
+/// Maximum total connections allowed
 const MAX_CONNECTIONS: usize = 64;
+/// Maximum connections per IP address
+const MAX_CONNECTIONS_PER_IP: usize = 8;
 /// Maximum messages per second per client (rate limit)
 const RATE_LIMIT_PER_SEC: u32 = 100;
 /// Maximum subscriptions per client
 const MAX_SUBS_PER_CLIENT: usize = 50;
+/// WebSocket handshake timeout (seconds) — kills Slowloris half-open connections
+const WS_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
 // ═══════════════════════════════════════════════════════════════════
 // Server
@@ -44,6 +48,8 @@ pub struct SyncServer {
     pub sync_engine: Arc<SyncEngine>,
     clients: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<String>>>>,
     connection_count: Arc<AtomicUsize>,
+    /// Per-IP connection count tracker
+    per_ip_counts: Arc<Mutex<HashMap<std::net::IpAddr, usize>>>,
     /// Optional auth token — if set, clients must send it on first message
     auth_token: Option<String>,
     /// Optional TLS config (cert + key paths)
@@ -57,6 +63,7 @@ impl SyncServer {
             sync_engine,
             clients: Arc::new(Mutex::new(HashMap::new())),
             connection_count: Arc::new(AtomicUsize::new(0)),
+            per_ip_counts: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             tls_cert: None,
             tls_key: None,
@@ -107,8 +114,9 @@ impl SyncServer {
 
         let scheme = if tls_acceptor.is_some() { "wss" } else { "ws" };
         println!("  🔌 WebSocket sync server listening on {}://{}", scheme, addr);
-        println!("  🛡️  Security: max_conn={}, rate_limit={}/s, max_msg={}KB, max_subs={}",
-            MAX_CONNECTIONS, RATE_LIMIT_PER_SEC, MAX_MESSAGE_SIZE / 1024, MAX_SUBS_PER_CLIENT
+        println!("  🛡️  Security: max_conn={}, per_ip={}, rate_limit={}/s, max_msg={}KB, max_subs={}, handshake_timeout={}s",
+            MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP, RATE_LIMIT_PER_SEC,
+            MAX_MESSAGE_SIZE / 1024, MAX_SUBS_PER_CLIENT, WS_HANDSHAKE_TIMEOUT_SECS
         );
         if self.auth_token.is_some() {
             println!("  🔒 Token authentication ENABLED");
@@ -147,28 +155,54 @@ impl SyncServer {
                 continue;
             }
 
+            // SECURITY: Per-IP connection limit — prevent one IP from hogging all slots
+            {
+                let mut ip_counts = self.per_ip_counts.lock().unwrap_or_else(|e| e.into_inner());
+                let ip = peer_addr.ip();
+                let count = ip_counts.entry(ip).or_insert(0);
+                if *count >= MAX_CONNECTIONS_PER_IP {
+                    eprintln!(
+                        "  ⚠ Connection rejected from {} (per-IP limit {}/{})",
+                        peer_addr, count, MAX_CONNECTIONS_PER_IP
+                    );
+                    // Release the global slot we just acquired
+                    self.connection_count.fetch_sub(1, Ordering::SeqCst);
+                    drop(stream);
+                    continue;
+                }
+                *count += 1;
+            }
+
             let sync_engine = self.sync_engine.clone();
             let clients = self.clients.clone();
             let conn_count = self.connection_count.clone();
             let auth_token = self.auth_token.clone();
             let tls = tls_acceptor.clone();
+            let per_ip_counts = self.per_ip_counts.clone();
 
             tokio::spawn(async move {
                 // Connection already counted above via compare_exchange
 
                 let result = if let Some(acceptor) = tls {
-                    // TLS connection: TCP → TLS → WebSocket
-                    match acceptor.accept(stream).await {
-                        Ok(tls_stream) => {
+                    // TLS connection: TCP → TLS → WebSocket (with timeout)
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(WS_HANDSHAKE_TIMEOUT_SECS),
+                        acceptor.accept(stream),
+                    ).await {
+                        Ok(Ok(tls_stream)) => {
                             handle_tls_connection(tls_stream, peer_addr, sync_engine, clients.clone(), auth_token).await
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             eprintln!("  ✗ TLS handshake failed for {}: {}", peer_addr, e);
+                            Ok(())
+                        }
+                        Err(_) => {
+                            eprintln!("  ✗ TLS handshake timeout for {} ({}s)", peer_addr, WS_HANDSHAKE_TIMEOUT_SECS);
                             Ok(())
                         }
                     }
                 } else {
-                    // Plain connection: TCP → WebSocket
+                    // Plain connection: TCP → WebSocket (with timeout)
                     handle_connection(stream, peer_addr, sync_engine, clients.clone(), auth_token).await
                 };
 
@@ -176,7 +210,18 @@ impl SyncServer {
                     eprintln!("  ✗ Client {} error: {}", peer_addr, e);
                 }
 
+                // Release global count
                 conn_count.fetch_sub(1, Ordering::SeqCst);
+                // Release per-IP count
+                if let Ok(mut ip_counts) = per_ip_counts.lock() {
+                    let ip = peer_addr.ip();
+                    if let Some(count) = ip_counts.get_mut(&ip) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            ip_counts.remove(&ip);
+                        }
+                    }
+                }
             });
         }
     }
@@ -239,7 +284,7 @@ async fn handle_tls_connection(
     handle_ws_stream(ws_stream, peer_addr, sync_engine, clients, auth_token).await
 }
 
-/// Handle a plain TCP WebSocket connection
+/// Handle a plain TCP WebSocket connection (with handshake timeout)
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -247,7 +292,17 @@ async fn handle_connection(
     clients: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<String>>>>,
     auth_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+    // SECURITY: Timeout the WS handshake to prevent Slowloris-style attacks
+    let ws_stream = match tokio::time::timeout(
+        std::time::Duration::from_secs(WS_HANDSHAKE_TIMEOUT_SECS),
+        tokio_tungstenite::accept_async(stream),
+    ).await {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => return Err(Box::new(e)),
+        Err(_) => {
+            return Err(format!("WS handshake timeout for {} ({}s)", peer_addr, WS_HANDSHAKE_TIMEOUT_SECS).into());
+        }
+    };
     handle_ws_stream(ws_stream, peer_addr, sync_engine, clients, auth_token).await
 }
 
