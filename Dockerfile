@@ -4,7 +4,7 @@
 # ═══════════════════════════════════════════════════════════════
 
 # Stage 1: Build
-FROM rust:latest AS builder
+FROM rust:bookworm AS builder
 
 WORKDIR /build
 COPY . .
