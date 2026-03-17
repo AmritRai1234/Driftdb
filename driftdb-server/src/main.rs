@@ -228,9 +228,17 @@ fn main() {
         }
         println!();
 
-        // Run REPL in the main thread
-        let mut repl = repl::Repl::new(executor, storage, cli.auth);
-        repl.run();
+        // Run REPL in the main thread — or block headless in Docker
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            let mut repl = repl::Repl::new(executor, storage, cli.auth);
+            repl.run();
+        } else {
+            // No TTY (Docker/systemd) — block forever, keep servers alive
+            println!("  ℹ Running headless (no TTY detected)");
+            println!("  Use the REST API / Dashboard to interact.\n");
+            std::thread::park(); // Block forever
+        }
     } else {
         // Interactive REPL mode (no WebSocket)
         let executor = Executor::new(graph, vector);
