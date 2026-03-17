@@ -13,10 +13,12 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && \
     cargo build --release && \
     strip target/release/driftdb
 
-# Stage 2: Runtime (minimal alpine)
-FROM alpine:3.21
+# Stage 2: Runtime (Debian slim — matches glibc from builder)
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache libgcc ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/driftdb /usr/local/bin/driftdb
 
