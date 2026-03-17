@@ -220,6 +220,11 @@ fn main() {
                 "🌐".to_string(),
                 format!("http://localhost:{}", cli.rest_port).bright_green()
             );
+            println!(
+                "  {} Dashboard:      {}",
+                "🖥".to_string(),
+                format!("http://localhost:{}/", cli.rest_port).bright_cyan()
+            );
         }
         println!();
 

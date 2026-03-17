@@ -14,9 +14,9 @@
 
 use axum::{
     extract::{ConnectInfo, Path, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware,
-    response::Json,
+    response::{Html, IntoResponse, Json},
     routing::{delete, get, post},
     Router,
 };
@@ -34,6 +34,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
+
+// ═══════════════════════════════════════════════════════════════════
+// Embedded Dashboard UI (compiled into binary — zero runtime deps)
+// ═══════════════════════════════════════════════════════════════════
+
+const DASHBOARD_HTML: &str = include_str!("../static/index.html");
+const DASHBOARD_CSS: &str = include_str!("../static/style.css");
+const DASHBOARD_JS: &str = include_str!("../static/app.js");
 
 // ═══════════════════════════════════════════════════════════════════
 // Security Constants
@@ -291,12 +299,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .allow_headers(tower_http::cors::Any);
 
     Router::new()
+        // ── Dashboard UI routes ──────────────────────────────────
+        .route("/", get(dashboard_handler))
+        .route("/dashboard", get(dashboard_handler))
+        .route("/static/style.css", get(css_handler))
+        .route("/static/app.js", get(js_handler))
+        // ── API routes ────────────────────────────────────────────
         .route("/health", get(health_handler))
         .route("/query", post(query_handler))
         .route("/nodes", get(list_nodes_handler))
         .route("/nodes", post(create_node_handler))
         .route("/nodes/{id}", get(get_node_handler))
         .route("/nodes/{id}", delete(delete_node_handler))
+        .route("/edges", get(list_edges_handler))
         .route("/backup", post(backup_handler))
         .layer(cors)
         // SECURITY: Global request body size limit — returns 413 for payloads > 1MB
@@ -345,7 +360,32 @@ pub async fn start_rest_server(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Handlers
+// Dashboard UI Handlers
+// ═══════════════════════════════════════════════════════════════════
+
+/// GET / — Serve the dashboard HTML
+async fn dashboard_handler() -> Html<&'static str> {
+    Html(DASHBOARD_HTML)
+}
+
+/// GET /static/style.css — Serve the dashboard CSS
+async fn css_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        DASHBOARD_CSS,
+    )
+}
+
+/// GET /static/app.js — Serve the dashboard JavaScript
+async fn js_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        DASHBOARD_JS,
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// API Handlers
 // ═══════════════════════════════════════════════════════════════════
 
 /// GET /health — Health check (rate-limited, minimal info without auth)
@@ -544,6 +584,32 @@ async fn delete_node_handler(
     let node_id = NodeId::from_str(&id);
     match state.graph.delete_node(&node_id) {
         Ok(()) => Ok(ApiResponse::ok(json!({"deleted": id}))),
+        Err(e) => Err(ApiResponse::err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("{}", e),
+        )),
+    }
+}
+
+/// GET /edges — List all edges
+async fn list_edges_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
+    check_auth_and_rate(&state, &headers, addr.ip())?;
+
+    // Execute SHOW EDGES via DriftQL
+    let result = {
+        let mut executor = state.executor.lock().unwrap_or_else(|e| e.into_inner());
+        let stmt = driftdb_query::parse("SHOW EDGES").map_err(|e| {
+            ApiResponse::err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{}", e))
+        })?;
+        executor.execute(stmt)
+    };
+
+    match result {
+        Ok(qr) => Ok(ApiResponse::ok(query_result_to_json(qr))),
         Err(e) => Err(ApiResponse::err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("{}", e),

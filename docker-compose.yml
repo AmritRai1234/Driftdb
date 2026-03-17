@@ -5,19 +5,24 @@ services:
     build: .
     container_name: driftdb
     ports:
-      - "9210:9210"   # WebSocket
-      - "9211:9211"   # REST API
+      - "${DRIFT_REST_PORT:-9211}:9211"   # REST API + Dashboard
+      - "${DRIFT_WS_PORT:-9210}:9210"     # WebSocket
     volumes:
       - drift_data:/data
       - drift_backups:/backups
     environment:
-      - DRIFT_TOKEN=change-me-in-production
+      - DRIFT_TOKEN=${DRIFT_TOKEN:-change-me-in-production}
     command: >
       --serve --rest
       --bind 0.0.0.0
       --data-dir /data
-      --ws-token change-me-in-production
+      --ws-token ${DRIFT_TOKEN:-change-me-in-production}
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9211/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
 
 volumes:
   drift_data:
