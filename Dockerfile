@@ -4,7 +4,7 @@
 # ═══════════════════════════════════════════════════════════════
 
 # Stage 1: Build
-FROM rust:1.85-slim AS builder
+FROM rust:latest AS builder
 
 WORKDIR /build
 COPY . .
@@ -24,14 +24,14 @@ COPY --from=builder /build/target/release/driftdb /usr/local/bin/driftdb
 RUN mkdir -p /data /backups
 VOLUME ["/data", "/backups"]
 
-# Expose ports: WebSocket (9210), REST API (9211)
+# Expose ports: WebSocket (9210), REST API + Dashboard (9211)
 EXPOSE 9210 9211
 
 # Health check via REST API
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
     CMD wget -qO- http://localhost:9211/health || exit 1
 
-# Default: start server with REST API, bind to all interfaces
-ENTRYPOINT ["driftdb"]
-CMD ["--serve", "--rest", "--bind", "0.0.0.0", \
-     "--data-dir", "/data"]
+# Default: start server with REST API + Dashboard, bind to all interfaces
+# Use shell form so $DRIFT_TOKEN env var is expanded at runtime
+CMD driftdb --serve --rest --bind 0.0.0.0 --data-dir /data \
+    ${DRIFT_TOKEN:+--ws-token $DRIFT_TOKEN}
